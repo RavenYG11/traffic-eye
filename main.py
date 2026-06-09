@@ -1,3 +1,5 @@
+# main.py
+
 import os
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
@@ -12,6 +14,7 @@ import cv2
 import time
 import threading
 import torch
+from collections import deque
 
 cv2.setNumThreads(1)
 torch.set_num_threads(2)
@@ -29,6 +32,9 @@ from config import (
     MODEL_IMGSZ,
     DETECTION_TARGET_FPS,
     DISPLAY_TARGET_FPS,
+    PLAYBACK_TARGET_FPS,
+    SOURCE_TARGET_FPS,
+    PLAYBACK_QUEUE_SIZE,
     MIN_BOX_AREA,
     VEHICLE_CLASS_IDS,
 )
@@ -36,26 +42,61 @@ from config import (
 WINDOW_NAME = "TRAFFIC_EYE AI - Smooth Preview Detection"
 
 
-class LatestFrameBuffer:
-    def __init__(self):
+class PlaybackFrameBuffer:
+    def __init__(self, max_queue_size=6):
         self.lock = threading.Lock()
-        self.frame = None
-        self.seq = 0
+
+        self.max_queue_size = max_queue_size
+        self.queue = deque()
+        self.dropped_playback_frames = 0
+
+        self.latest_frame = None
+        self.latest_seq = 0
+
         self.connected = False
         self.source_fps = 0.0
+        self.read_ms = 0.0
+        self.frame_gap_ms = 0.0
+        self.queue_size = 0
 
-    def set(self, frame, connected=True):
+    def set(self, frame, connected=True, read_ms=0.0, frame_gap_ms=0.0):
         with self.lock:
-            self.frame = frame
-            self.seq += 1
+            self.latest_seq += 1
+
+            item = {
+                "frame": frame,
+                "seq": self.latest_seq,
+            }
+
+            if len(self.queue) < self.max_queue_size:
+                self.queue.append(item)
+            else:
+                # Queue penuh: jangan buang frame lama.
+                # Buang frame baru supaya playback tetap jalan berurut.
+                self.dropped_playback_frames += 1
+
+            self.latest_frame = frame
             self.connected = connected
+            self.read_ms = read_ms
+            self.frame_gap_ms = frame_gap_ms
+            self.queue_size = len(self.queue)
 
-    def get(self):
+    def pop_playback_frame(self):
         with self.lock:
-            if self.frame is None:
-                return None, self.seq, self.connected
+            if not self.queue:
+                return None, self.latest_seq, self.connected
 
-            return self.frame.copy(), self.seq, self.connected
+            item = self.queue.popleft()
+            self.queue_size = len(self.queue)
+
+            return item["frame"].copy(), item["seq"], self.connected
+
+    def get_latest_frame(self):
+        with self.lock:
+            if self.latest_frame is None:
+                return None, self.latest_seq, self.connected
+
+            return self.latest_frame.copy(), self.latest_seq, self.connected
 
     def set_connected(self, connected):
         with self.lock:
@@ -65,9 +106,18 @@ class LatestFrameBuffer:
         with self.lock:
             self.source_fps = source_fps
 
-    def get_source_fps(self):
+    def get_stream_metrics(self):
         with self.lock:
-            return self.source_fps
+            return (
+                self.source_fps,
+                self.read_ms,
+                self.frame_gap_ms,
+                self.queue_size,
+            )
+
+    def get_queue_status(self):
+        with self.lock:
+            return len(self.queue), self.latest_seq, self.connected
 
 
 class DetectionBuffer:
@@ -118,13 +168,15 @@ class CCTVReaderThread:
             self.cap.release()
 
     def open_stream(self):
-        cap = cv2.VideoCapture(self.stream_url, cv2.CAP_FFMPEG)
+        cap = cv2.VideoCapture(self.stream_url)
 
         if not cap.isOpened():
             print("[ERROR] Stream tidak bisa dibuka.")
             return None
 
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Jangan paksa buffer size 1 untuk HLS.
+        # Buffer terlalu kecil bikin stream terasa stop-start.
+        # cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         print(f"[OK] Stream terbuka: {CAMERA_NAME}")
         return cap
@@ -132,7 +184,20 @@ class CCTVReaderThread:
     def loop(self):
         source_fps_timer = time.perf_counter()
         source_fps_count = 0
+        last_frame_time = None
+        source_interval = 1.0 / max(SOURCE_TARGET_FPS, 1)
+        next_read_at = time.perf_counter()
+
         while self.running:
+            now_limit = time.perf_counter()
+
+            if now_limit < next_read_at:
+                time.sleep(min(next_read_at - now_limit, 0.02))
+                continue
+
+            next_read_at = time.perf_counter() + source_interval
+            loop_start = time.perf_counter()
+
             if self.cap is None:
                 self.frame_buffer.set_connected(False)
                 self.cap = self.open_stream()
@@ -144,7 +209,9 @@ class CCTVReaderThread:
                 self.frame_buffer.set_connected(True)
 
             try:
+                read_start = time.perf_counter()
                 ret, frame = self.cap.read()
+                read_ms = (time.perf_counter() - read_start) * 1000
             except Exception as e:
                 print(f"[WARN] Exception saat baca frame: {e}. Reconnect...")
 
@@ -169,7 +236,22 @@ class CCTVReaderThread:
                 time.sleep(1)
                 continue
 
-            self.frame_buffer.set(frame, connected=True)
+            now_frame_time = time.perf_counter()
+
+            if last_frame_time is None:
+                frame_gap_ms = 0.0
+            else:
+                frame_gap_ms = (now_frame_time - last_frame_time) * 1000
+
+            last_frame_time = now_frame_time
+
+            frame = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
+            self.frame_buffer.set(
+                frame,
+                connected=True,
+                read_ms=read_ms,
+                frame_gap_ms=frame_gap_ms,
+            )
             source_fps_count += 1
             source_fps_now = time.perf_counter()
 
@@ -205,11 +287,8 @@ class DetectorThread:
         if class_id == 3:
             return "motor"
 
-        if class_id == 2:
+        if class_id in [2, 5, 7]:
             return "mobil"
-
-        if class_id in [5, 7]:
-            return "kendaraan_besar"
 
         return "unknown"
 
@@ -266,7 +345,7 @@ class DetectorThread:
                 time.sleep(0.005)
                 continue
 
-            frame, seq, connected = self.frame_buffer.get()
+            frame, seq, connected = self.frame_buffer.get_latest_frame()
 
             if frame is None:
                 time.sleep(0.05)
@@ -278,8 +357,6 @@ class DetectorThread:
 
             self.last_processed_seq = seq
             last_detect_time = now
-
-            frame = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
 
             infer_start = time.perf_counter()
             detections = self.run_detection(frame)
@@ -305,7 +382,6 @@ def count_vehicle_types(detections):
     counts = {
         "motor": 0,
         "mobil": 0,
-        "kendaraan_besar": 0,
     }
 
     for det in detections:
@@ -343,6 +419,9 @@ def draw_hud(
     counts,
     display_fps,
     source_fps,
+    read_ms,
+    frame_gap_ms,
+    queue_size,
     detect_fps,
     infer_ms,
     connected,
@@ -362,11 +441,7 @@ def draw_hud(
         cv2.LINE_AA,
     )
 
-    counter_text = (
-        f"Motor: {counts['motor']} | "
-        f"Mobil: {counts['mobil']} | "
-        f"Besar: {counts['kendaraan_besar']}"
-    )
+    counter_text = f"Motor: {counts['motor']} | " f"Mobil: {counts['mobil']} | "
 
     cv2.putText(
         frame,
@@ -382,6 +457,9 @@ def draw_hud(
     perf_text = (
         f"Display FPS: {display_fps:.1f} | "
         f"Source FPS: {source_fps:.1f} | "
+        f"Read: {read_ms:.0f} ms | "
+        f"Gap: {frame_gap_ms:.0f} ms | "
+        f"Queue: {queue_size} | "
         f"Detect FPS: {detect_fps:.1f} | "
         f"Infer: {infer_ms:.0f} ms"
     )
@@ -419,7 +497,7 @@ def main():
     except Exception:
         pass
 
-    frame_buffer = LatestFrameBuffer()
+    frame_buffer = PlaybackFrameBuffer(max_queue_size=PLAYBACK_QUEUE_SIZE)
     detection_buffer = DetectionBuffer()
 
     reader = CCTVReaderThread(STREAM_URL, frame_buffer)
@@ -435,35 +513,69 @@ def main():
     fps_count = 0
     display_fps = 0.0
 
-    frame_delay = 1.0 / max(DISPLAY_TARGET_FPS, 1)
+    render_delay = 1.0 / max(DISPLAY_TARGET_FPS, 1)
+    playback_delay = 1.0 / max(PLAYBACK_TARGET_FPS, 1)
+
+    last_display_frame = None
+    last_playback_pop_time = 0.0
+    last_frame_seq = -1
 
     try:
         while True:
             loop_start = time.perf_counter()
 
-            frame, frame_seq, connected = frame_buffer.get()
+            queue_size_now, latest_seq_now, connected_now = (
+                frame_buffer.get_queue_status()
+            )
+
+            now_playback = time.perf_counter()
+            should_pop_new_frame = (
+                last_display_frame is None
+                or now_playback - last_playback_pop_time >= playback_delay
+            )
+
+            # Kalau waktunya belum ambil frame baru,
+            # render ulang frame terakhir saja.
+            # Ini bikin window bisa 35 FPS tanpa mempercepat video.
+            if not should_pop_new_frame and last_display_frame is not None:
+                frame = last_display_frame.copy()
+                frame_seq = last_frame_seq
+                connected = connected_now
+            else:
+                # Kalau belum pernah ada frame tampil sama sekali,
+                # tunggu diam sampai frame pertama masuk.
+                if queue_size_now <= 0 and last_display_frame is None:
+                    key = cv2.waitKey(1) & 0xFF
+
+                    if key == ord("q"):
+                        break
+
+                    time.sleep(0.01)
+                    continue
+
+                # Kalau queue kosong setelah pernah tampil,
+                # tahan frame terakhir tanpa teks buffering.
+                if queue_size_now <= 0 and last_display_frame is not None:
+                    frame = last_display_frame.copy()
+                    frame_seq = last_frame_seq
+                    connected = connected_now
+                else:
+                    # Ini baru ambil frame CCTV berikutnya secara FIFO.
+                    frame, frame_seq, connected = frame_buffer.pop_playback_frame()
+
+                    last_playback_pop_time = now_playback
+                    last_frame_seq = frame_seq
 
             if frame is None:
-                frame = 255 * cv2.UMat(DISPLAY_HEIGHT, DISPLAY_WIDTH, cv2.CV_8UC3).get()
+                key = cv2.waitKey(1) & 0xFF
 
-                cv2.putText(
-                    frame,
-                    "Waiting for CCTV stream...",
-                    (30, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
-                    (0, 0, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
+                if key == ord("q"):
+                    break
 
-                detections = []
-                infer_ms = 0.0
-                detect_fps = 0.0
-                detect_seq = -1
-            else:
-                frame = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
-                detections, infer_ms, detect_fps, detect_seq = detection_buffer.get()
+                time.sleep(0.03)
+                continue
+
+            detections, infer_ms, detect_fps, detect_seq = detection_buffer.get()
 
             counts = count_vehicle_types(detections)
 
@@ -477,13 +589,18 @@ def main():
                 display_fps = fps_count / (now - fps_timer)
                 fps_timer = now
                 fps_count = 0
-            source_fps = frame_buffer.get_source_fps()
+            source_fps, read_ms, frame_gap_ms, queue_size = (
+                frame_buffer.get_stream_metrics()
+            )
 
             draw_hud(
                 frame=frame,
                 counts=counts,
                 display_fps=display_fps,
                 source_fps=source_fps,
+                read_ms=read_ms,
+                frame_gap_ms=frame_gap_ms,
+                queue_size=queue_size,
                 detect_fps=detect_fps,
                 infer_ms=infer_ms,
                 connected=connected,
@@ -491,6 +608,7 @@ def main():
                 detect_seq=detect_seq,
             )
 
+            last_display_frame = frame.copy()
             cv2.imshow(WINDOW_NAME, frame)
 
             key = cv2.waitKey(1) & 0xFF
@@ -499,7 +617,7 @@ def main():
                 break
 
             elapsed = time.perf_counter() - loop_start
-            sleep_time = frame_delay - elapsed
+            sleep_time = render_delay - elapsed
 
             if sleep_time > 0:
                 time.sleep(sleep_time)
