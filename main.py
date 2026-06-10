@@ -11,6 +11,7 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
 )
 
 import cv2
+import numpy as np
 import time
 import threading
 import torch
@@ -36,6 +37,29 @@ from config import (
     SOURCE_TARGET_FPS,
     PLAYBACK_QUEUE_SIZE,
     MIN_BOX_AREA,
+    MAX_BOX_AREA_RATIO,
+    MIN_BOX_WIDTH,
+    MIN_BOX_HEIGHT,
+    MIN_MOTOR_CONF,
+    MIN_MOBIL_CONF,
+    MIN_ASPECT_RATIO,
+    MAX_ASPECT_RATIO,
+    ROI_POLYGON,
+    SHOW_ZONE_DEBUG,
+    IN_ZONE_POLYGON,
+    OUT_ZONE_POLYGON,
+    VIOLATION_ZONE_POLYGON,
+    UPSTREAM_ZONE_POLYGON,
+    MAX_DETECTION_SEQ_GAP,
+    TRAJECTORY_MAX_POINTS,
+    TRACK_MATCH_DISTANCE,
+    TRACK_MAX_MISSED_FRAMES,
+    DIRECTION_MIN_MOVE_PX,
+    TRACK_DRAW_HOLD_FRAMES,
+    DRAW_BOX_SHRINK_RATIO,
+    WRONG_WAY_RECENT_UP_MOVE_PX,
+    WRONG_WAY_NET_UP_MOVE_PX,
+    TRACKER_CONFIG,
     VEHICLE_CLASS_IDS,
 )
 
@@ -52,6 +76,12 @@ class PlaybackFrameBuffer:
 
         self.latest_frame = None
         self.latest_seq = 0
+
+        # Frame yang benar-benar sedang diputar/display.
+        # Detector akan baca ini supaya box lebih sinkron dengan preview.
+        self.playback_frame = None
+        self.playback_seq = -1
+        self.playback_connected = False
 
         self.connected = False
         self.source_fps = 0.0
@@ -98,6 +128,26 @@ class PlaybackFrameBuffer:
 
             return self.latest_frame.copy(), self.latest_seq, self.connected
 
+    def set_playback_frame(self, frame, seq, connected):
+        with self.lock:
+            if frame is None:
+                return
+
+            self.playback_frame = frame.copy()
+            self.playback_seq = seq
+            self.playback_connected = connected
+
+    def get_playback_frame(self):
+        with self.lock:
+            if self.playback_frame is None:
+                return None, self.playback_seq, self.playback_connected
+
+            return (
+                self.playback_frame.copy(),
+                self.playback_seq,
+                self.playback_connected,
+            )
+
     def set_connected(self, connected):
         with self.lock:
             self.connected = connected
@@ -143,6 +193,259 @@ class DetectionBuffer:
                 self.detect_fps,
                 self.last_seq,
             )
+
+
+class TrajectoryTracker:
+    def __init__(self):
+        self.next_fallback_track_id = 100000
+        self.tracks = {}
+
+    def point_inside_polygon(self, point, polygon):
+        if not polygon:
+            return False
+
+        px, py = point
+        poly = np.array(polygon, dtype=np.int32)
+
+        return (
+            cv2.pointPolygonTest(
+                poly,
+                (float(px), float(py)),
+                False,
+            )
+            >= 0
+        )
+
+    def get_zone_name(self, center):
+        # Finish zone merah dicek dulu supaya kalau polygon overlap,
+        # merah tetap menang.
+        if self.point_inside_polygon(center, VIOLATION_ZONE_POLYGON):
+            return "violation_zone"
+
+        if self.point_inside_polygon(center, IN_ZONE_POLYGON):
+            return "in_zone"
+
+        if self.point_inside_polygon(center, OUT_ZONE_POLYGON):
+            return "out_zone"
+
+        if self.point_inside_polygon(center, UPSTREAM_ZONE_POLYGON):
+            return "upstream_zone"
+
+        return "road_zone"
+
+    def get_fallback_track_id(self, detection):
+        # Fallback kalau ByteTrack belum kasih ID.
+        # Tetap pakai center supaya tidak crash, tapi ini bukan tracking final.
+        center = detection.get("center")
+
+        if center is None:
+            self.next_fallback_track_id += 1
+            return self.next_fallback_track_id
+
+        cx, cy = center
+        best_track_id = None
+        best_distance = TRACK_MATCH_DISTANCE
+
+        for track_id, track in self.tracks.items():
+            if not str(track_id).startswith("fallback_"):
+                continue
+
+            if track["vehicle_type"] != detection.get("vehicle_type"):
+                continue
+
+            last_x, last_y = track["history"][-1]
+            distance = ((cx - last_x) ** 2 + (cy - last_y) ** 2) ** 0.5
+
+            if distance < best_distance:
+                best_distance = distance
+                best_track_id = track_id
+
+        if best_track_id is not None:
+            return best_track_id
+
+        self.next_fallback_track_id += 1
+        return f"fallback_{self.next_fallback_track_id}"
+
+    def classify_direction(self, track):
+        history = list(track["history"])
+        zones = list(track["zones"])
+
+        if len(history) < 4:
+            return track.get("final_status", "unknown")
+
+        # Kalau status sudah pernah terkunci, jangan berubah-ubah lagi.
+        if track.get("final_status", "unknown") != "unknown":
+            return track["final_status"]
+
+        current_zone = zones[-1]
+
+        start_x, start_y = history[0]
+        end_x, end_y = history[-1]
+
+        net_dx = end_x - start_x
+        net_dy = end_y - start_y
+        move_dist = ((net_dx**2) + (net_dy**2)) ** 0.5
+
+        # Jangan nilai status kalau trajectory belum cukup bergerak.
+        # Ini mencegah object yang baru muncul di IN langsung dianggap IN.
+        if move_dist < DIRECTION_MIN_MOVE_PX:
+            return "unknown"
+
+        origin_zone = track.get("origin_zone")
+
+        if origin_zone is None:
+            return "unknown"
+
+        # Kalau object masih di zone asalnya, jangan langsung kasih status.
+        # Contoh: motor muncul pertama kali di IN zone.
+        # Dia tetap TRACK sampai masuk zone lain.
+        if current_zone == origin_zone:
+            return "unknown"
+
+        # Masuk area merah dari zone mana pun selain merah = pelanggaran.
+        if current_zone == "violation_zone" and origin_zone != "violation_zone":
+            track["final_status"] = "wrong_way"
+            return "wrong_way"
+
+        # Masuk area biru dari zone lain = IN.
+        if current_zone == "in_zone" and origin_zone != "in_zone":
+            track["final_status"] = "in"
+            return "in"
+
+        # Masuk area oren dari zone lain = OUT.
+        if current_zone == "out_zone" and origin_zone != "out_zone":
+            track["final_status"] = "out"
+            return "out"
+
+        return "unknown"
+
+    def update(self, detections):
+        for track in self.tracks.values():
+            track["missed"] += 1
+
+        updated_detections = []
+
+        for detection in detections:
+            center = detection.get("center")
+            vehicle_type = detection.get("vehicle_type")
+
+            if center is None:
+                updated_detections.append(detection)
+                continue
+
+            track_id = detection.get("track_id")
+
+            if track_id is None:
+                track_id = self.get_fallback_track_id(detection)
+
+            if track_id not in self.tracks:
+                self.tracks[track_id] = {
+                    "vehicle_type": vehicle_type,
+                    "history": deque(maxlen=TRAJECTORY_MAX_POINTS),
+                    "zones": deque(maxlen=TRAJECTORY_MAX_POINTS),
+                    "missed": 0,
+                    # Zone pertama saat object muncul.
+                    # Ini dipakai sebagai asal trajectory.
+                    "origin_zone": None,
+                    # Kalau sudah IN/OUT/VIOLATION, status dikunci.
+                    "final_status": "unknown",
+                }
+
+            track = self.tracks[track_id]
+            track["vehicle_type"] = vehicle_type
+            track["history"].append(center)
+            track["zones"].append(self.get_zone_name(center))
+            track["missed"] = 0
+
+            if track["origin_zone"] is None:
+                track["origin_zone"] = track["zones"][-1]
+
+            direction = self.classify_direction(track)
+
+            detection = dict(detection)
+            detection["track_id"] = track_id
+            detection["trajectory"] = list(track["history"])
+            detection["zone"] = track["zones"][-1]
+            detection["direction"] = direction
+
+            updated_detections.append(detection)
+
+        stale_track_ids = [
+            track_id
+            for track_id, track in self.tracks.items()
+            if track["missed"] > TRACK_MAX_MISSED_FRAMES
+        ]
+
+        for track_id in stale_track_ids:
+            del self.tracks[track_id]
+
+        return updated_detections
+
+
+class DetectionStabilizer:
+    def __init__(self):
+        self.tracks = {}
+
+    def get_key(self, detection):
+        track_id = detection.get("track_id")
+
+        if track_id is not None:
+            return track_id
+
+        center = detection.get("center")
+        vehicle_type = detection.get("vehicle_type", "unknown")
+
+        if center is None:
+            return None
+
+        cx, cy = center
+
+        # Fallback kalau track_id tidak ada.
+        # Dibulatkan supaya object dekat tidak bikin key terlalu liar.
+        return f"{vehicle_type}_{cx // 40}_{cy // 40}"
+
+    def update(self, detections):
+        for track in self.tracks.values():
+            track["missed"] += 1
+
+        for detection in detections:
+            key = self.get_key(detection)
+
+            if key is None:
+                continue
+
+            detection = dict(detection)
+            detection["missed"] = 0
+            detection["is_hold"] = False
+
+            self.tracks[key] = {
+                "detection": detection,
+                "missed": 0,
+            }
+
+        stable_detections = []
+
+        stale_keys = []
+
+        for key, track in self.tracks.items():
+            missed = track["missed"]
+
+            if missed > TRACK_DRAW_HOLD_FRAMES:
+                stale_keys.append(key)
+                continue
+
+            detection = dict(track["detection"])
+
+            if missed > 0:
+                detection["is_hold"] = True
+                detection["missed"] = missed
+
+            stable_detections.append(detection)
+
+        for key in stale_keys:
+            del self.tracks[key]
+
+        return stable_detections
 
 
 class CCTVReaderThread:
@@ -292,14 +595,68 @@ class DetectorThread:
 
         return "unknown"
 
+    def is_inside_roi(self, cx, cy):
+        if not ROI_POLYGON:
+            return True
+
+        roi = np.array(ROI_POLYGON, dtype=np.int32)
+
+        return (
+            cv2.pointPolygonTest(
+                roi,
+                (float(cx), float(cy)),
+                False,
+            )
+            >= 0
+        )
+
+    def is_valid_detection_box(self, x1, y1, x2, y2, vehicle_type, confidence):
+        box_w = max(0, x2 - x1)
+        box_h = max(0, y2 - y1)
+
+        if box_w < MIN_BOX_WIDTH or box_h < MIN_BOX_HEIGHT:
+            return False
+
+        box_area = box_w * box_h
+
+        if box_area < MIN_BOX_AREA:
+            return False
+
+        frame_area = DISPLAY_WIDTH * DISPLAY_HEIGHT
+        max_box_area = frame_area * MAX_BOX_AREA_RATIO
+
+        if box_area > max_box_area:
+            return False
+
+        aspect_ratio = box_w / max(box_h, 1)
+
+        if aspect_ratio < MIN_ASPECT_RATIO or aspect_ratio > MAX_ASPECT_RATIO:
+            return False
+
+        if vehicle_type == "motor" and confidence < MIN_MOTOR_CONF:
+            return False
+
+        if vehicle_type == "mobil" and confidence < MIN_MOBIL_CONF:
+            return False
+
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+
+        if not self.is_inside_roi(cx, cy):
+            return False
+
+        return True
+
     def run_detection(self, frame):
-        results = self.model.predict(
+        results = self.model.track(
             frame,
             conf=CONF_THRESHOLD,
             classes=VEHICLE_CLASS_IDS,
             imgsz=MODEL_IMGSZ,
             verbose=False,
             device="cpu",
+            persist=True,
+            tracker=TRACKER_CONFIG,
         )
 
         detections = []
@@ -310,21 +667,38 @@ class DetectorThread:
                 confidence = float(box.conf[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
 
+                if box.id is None:
+                    track_id = None
+                else:
+                    track_id = int(box.id[0])
+
                 vehicle_type = self.map_vehicle_type(class_id)
 
                 if vehicle_type == "unknown":
                     continue
 
-                box_area = max(0, x2 - x1) * max(0, y2 - y1)
-
-                if box_area < MIN_BOX_AREA:
+                if not self.is_valid_detection_box(
+                    x1=x1,
+                    y1=y1,
+                    x2=x2,
+                    y2=y2,
+                    vehicle_type=vehicle_type,
+                    confidence=confidence,
+                ):
                     continue
+
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
 
                 detections.append(
                     {
                         "box": (x1, y1, x2, y2),
+                        "center": (cx, cy),
                         "vehicle_type": vehicle_type,
                         "confidence": confidence,
+                        "direction": "unknown",
+                        "track_id": track_id,
+                        "trajectory": [],
                     }
                 )
 
@@ -345,7 +719,7 @@ class DetectorThread:
                 time.sleep(0.005)
                 continue
 
-            frame, seq, connected = self.frame_buffer.get_latest_frame()
+            frame, seq, connected = self.frame_buffer.get_playback_frame()
 
             if frame is None:
                 time.sleep(0.05)
@@ -382,33 +756,212 @@ def count_vehicle_types(detections):
     counts = {
         "motor": 0,
         "mobil": 0,
+        "pelanggaran": 0,
     }
 
     for det in detections:
         vehicle_type = det["vehicle_type"]
+        direction = det.get("direction", "unknown")
 
         if vehicle_type in counts:
             counts[vehicle_type] += 1
 
+        if direction == "wrong_way":
+            counts["pelanggaran"] += 1
+
     return counts
 
 
+def get_direction_label(direction):
+    if direction == "in":
+        return "IN"
+
+    if direction == "out":
+        return "OUT"
+
+    if direction == "wrong_way":
+        return "LAWAN_ARAH"
+
+    return "TRACK"
+
+
+def get_detection_color(detection):
+    vehicle_type = detection.get("vehicle_type")
+    direction = detection.get("direction", "unknown")
+
+    # OpenCV pakai BGR, bukan RGB.
+    if direction == "wrong_way":
+        return (0, 0, 255)  # merah
+
+    if vehicle_type == "motor":
+        return (0, 165, 255)  # oranye
+
+    if vehicle_type == "mobil":
+        return (255, 220, 0)  # biru
+
+    return (0, 255, 0)  # fallback hijau
+
+
+def draw_polygon_outline(frame, points, color, label):
+    if not points:
+        return
+
+    polygon = np.array(points, dtype=np.int32)
+
+    cv2.polylines(
+        frame,
+        [polygon],
+        isClosed=True,
+        color=color,
+        thickness=2,
+        lineType=cv2.LINE_AA,
+    )
+
+    label_x, label_y = points[0]
+
+    cv2.putText(
+        frame,
+        label,
+        (label_x + 5, label_y + 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def draw_zone_debug(frame):
+    if not SHOW_ZONE_DEBUG:
+        return
+
+    draw_polygon_outline(
+        frame,
+        ROI_POLYGON,
+        (255, 255, 255),
+        "ROI",
+    )
+
+    draw_polygon_outline(
+        frame,
+        IN_ZONE_POLYGON,
+        (255, 0, 0),
+        "IN_ZONE",
+    )
+
+    draw_polygon_outline(
+        frame,
+        OUT_ZONE_POLYGON,
+        (0, 165, 255),
+        "OUT_ZONE",
+    )
+
+    draw_polygon_outline(
+        frame,
+        UPSTREAM_ZONE_POLYGON,
+        (0, 0, 255),
+        "UPSTREAM",
+    )
+
+    draw_polygon_outline(
+        frame,
+        VIOLATION_ZONE_POLYGON,
+        (0, 0, 255),
+        "VIOLATION_ZONE",
+    )
+
+
+def draw_trajectory(frame, detection):
+    trajectory = detection.get("trajectory", [])
+
+    if len(trajectory) < 2:
+        return
+
+    color = get_detection_color(detection)
+
+    for i in range(1, len(trajectory)):
+        cv2.line(
+            frame,
+            trajectory[i - 1],
+            trajectory[i],
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+    cv2.arrowedLine(
+        frame,
+        trajectory[-2],
+        trajectory[-1],
+        color,
+        2,
+        cv2.LINE_AA,
+        tipLength=0.35,
+    )
+
+
+def shrink_box_for_draw(box):
+    x1, y1, x2, y2 = box
+
+    box_w = max(1, x2 - x1)
+    box_h = max(1, y2 - y1)
+
+    shrink_x = int(box_w * DRAW_BOX_SHRINK_RATIO)
+    shrink_y = int(box_h * DRAW_BOX_SHRINK_RATIO)
+
+    new_x1 = x1 + shrink_x
+    new_y1 = y1 + shrink_y
+    new_x2 = x2 - shrink_x
+    new_y2 = y2 - shrink_y
+
+    if new_x2 <= new_x1 or new_y2 <= new_y1:
+        return box
+
+    return new_x1, new_y1, new_x2, new_y2
+
+
 def draw_detection(frame, detection):
-    x1, y1, x2, y2 = detection["box"]
+    x1, y1, x2, y2 = shrink_box_for_draw(detection["box"])
     vehicle_type = detection["vehicle_type"]
     confidence = detection["confidence"]
+    track_id = detection.get("track_id")
+    direction = detection.get("direction", "unknown")
 
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    color = get_detection_color(detection)
+    direction_label = get_direction_label(direction)
 
-    text = f"{vehicle_type} {confidence:.2f}"
+    draw_trajectory(frame, detection)
+
+    thickness = 1 if detection.get("is_hold") else 2
+
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+
+    if track_id is None:
+        text = f"{vehicle_type} {direction_label} {confidence:.2f}"
+    else:
+        text = f"ID:{track_id} {vehicle_type} {direction_label} {confidence:.2f}"
+
+        text_pos = (x1, max(y1 - 8, 20))
+
+    # Outline hitam supaya tulisan tetap kebaca di kendaraan terang/gelap.
+    cv2.putText(
+        frame,
+        text,
+        text_pos,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 0, 0),
+        4,
+        cv2.LINE_AA,
+    )
 
     cv2.putText(
         frame,
         text,
-        (x1, max(y1 - 8, 20)),
+        text_pos,
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 255, 0),
+        0.55,
+        color,
         2,
         cv2.LINE_AA,
     )
@@ -441,7 +994,11 @@ def draw_hud(
         cv2.LINE_AA,
     )
 
-    counter_text = f"Motor: {counts['motor']} | " f"Mobil: {counts['mobil']} | "
+    counter_text = (
+        f"Motor: {counts['motor']} | "
+        f"Mobil: {counts['mobil']} | "
+        f"Pelanggaran: {counts['pelanggaran']}"
+    )
 
     cv2.putText(
         frame,
@@ -499,6 +1056,8 @@ def main():
 
     frame_buffer = PlaybackFrameBuffer(max_queue_size=PLAYBACK_QUEUE_SIZE)
     detection_buffer = DetectionBuffer()
+    trajectory_tracker = TrajectoryTracker()
+    detection_stabilizer = DetectionStabilizer()
 
     reader = CCTVReaderThread(STREAM_URL, frame_buffer)
     detector = DetectorThread(model, frame_buffer, detection_buffer)
@@ -575,9 +1134,28 @@ def main():
                 time.sleep(0.03)
                 continue
 
+            # Kirim frame yang benar-benar sedang tampil ke detector.
+            # Ini bikin box tidak ngikut latest stream yang beda timing.
+            frame_buffer.set_playback_frame(frame, frame_seq, connected)
+
             detections, infer_ms, detect_fps, detect_seq = detection_buffer.get()
 
+            if detect_seq >= 0:
+                seq_gap = abs(frame_seq - detect_seq)
+            else:
+                seq_gap = 999999
+
+            # Kalau detection terlalu beda jauh dari frame yang sedang tampil,
+            # jangan gambar box. Ini mencegah box terlihat telat/ngawur.
+            if seq_gap > MAX_DETECTION_SEQ_GAP:
+                detections = detection_stabilizer.update([])
+            else:
+                detections = trajectory_tracker.update(detections)
+                detections = detection_stabilizer.update(detections)
+
             counts = count_vehicle_types(detections)
+
+            draw_zone_debug(frame)
 
             for detection in detections:
                 draw_detection(frame, detection)
