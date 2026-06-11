@@ -7,8 +7,8 @@ DISPLAY_HEIGHT = 540
 
 YOLO_MODEL = "models/yolo26n.pt"
 
-CONF_THRESHOLD = 0.12
-MODEL_IMGSZ = 800
+CONF_THRESHOLD = 0.18
+MODEL_IMGSZ = 768
 
 # Detection target FPS. Ini bukan display FPS.
 DETECTION_TARGET_FPS = 8
@@ -56,6 +56,20 @@ MIN_MOBIL_CONF = 0.30
 # Terlalu gepeng / terlalu tinggi biasanya noise atau salah deteksi.
 MIN_ASPECT_RATIO = 0.20
 MAX_ASPECT_RATIO = 6.20
+
+
+# Khusus bantu motor kecil di area atas / violation.
+MOTOR_RESCUE_ENABLED = False
+MOTOR_RESCUE_CONF = 0.08
+MOTOR_RESCUE_IMGSZ = 640
+MOTOR_RESCUE_PADDING = 35
+MOTOR_RESCUE_MIN_BOX_AREA = 45
+
+# Stabilizer box supaya tidak kedip dan box tetap ngikut object.
+SMOOTH_BOX_ALPHA = 0.55
+PREDICT_BOX_WHEN_MISSED = False
+STABLE_MATCH_DISTANCE_MOTOR = 95
+STABLE_MATCH_DISTANCE_MOBIL = 130
 
 # ROI area jalan untuk Perempatan Caman.
 # Format: titik polygon dalam koordinat frame 960x540.
@@ -124,10 +138,10 @@ OUT_ZONE_POLYGON = [
 VIOLATION_ZONE_POLYGON = [
     (390, 95),
     (960, 95),
-    (960, 335),
-    (720, 280),
-    (520, 220),
-    (390, 160),
+    (960, 305),
+    (720, 255),
+    (520, 200),
+    (390, 145),
 ]
 
 # Kalau jarak seq detection terlalu jauh dari frame tampil,
@@ -146,7 +160,7 @@ DIRECTION_MIN_MOVE_PX = 35
 
 # Kalau YOLO miss sebentar, box tetap ditahan beberapa frame
 # supaya tidak kedip-kedip.
-TRACK_DRAW_HOLD_FRAMES = 7
+TRACK_DRAW_HOLD_FRAMES = 45
 
 # Kecilkan box hanya untuk tampilan.
 # Ini tidak mengubah center tracking / logic direction.

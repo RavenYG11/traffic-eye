@@ -58,6 +58,15 @@ from config import (
     DRAW_BOX_SHRINK_RATIO,
     WRONG_WAY_RECENT_UP_MOVE_PX,
     WRONG_WAY_NET_UP_MOVE_PX,
+    MOTOR_RESCUE_ENABLED,
+    MOTOR_RESCUE_CONF,
+    MOTOR_RESCUE_IMGSZ,
+    MOTOR_RESCUE_PADDING,
+    MOTOR_RESCUE_MIN_BOX_AREA,
+    SMOOTH_BOX_ALPHA,
+    PREDICT_BOX_WHEN_MISSED,
+    STABLE_MATCH_DISTANCE_MOTOR,
+    STABLE_MATCH_DISTANCE_MOBIL,
     TRACKER_CONFIG,
     VEHICLE_CLASS_IDS,
 )
@@ -388,8 +397,6 @@ class DetectionStabilizer:
 
         cx, cy = center
 
-        # Fallback kalau track_id tidak ada.
-        # Dibulatkan supaya object dekat tidak bikin key terlalu liar.
         return f"{vehicle_type}_{cx // 40}_{cy // 40}"
 
     def update(self, detections):
@@ -412,7 +419,6 @@ class DetectionStabilizer:
             }
 
         stable_detections = []
-
         stale_keys = []
 
         for key, track in self.tracks.items():
@@ -598,6 +604,79 @@ class DetectorThread:
             >= 0
         )
 
+    def is_inside_polygon(self, cx, cy, polygon):
+        if not polygon:
+            return False
+
+        poly = np.array(polygon, dtype=np.int32)
+
+        return (
+            cv2.pointPolygonTest(
+                poly,
+                (float(cx), float(cy)),
+                False,
+            )
+            >= 0
+        )
+
+    def polygon_bbox(self, polygon, padding=0):
+        pts = np.array(polygon, dtype=np.int32)
+
+        x, y, w, h = cv2.boundingRect(pts)
+
+        x1 = max(0, x - padding)
+        y1 = max(0, y - padding)
+        x2 = min(DISPLAY_WIDTH, x + w + padding)
+        y2 = min(DISPLAY_HEIGHT, y + h + padding)
+
+        return x1, y1, x2, y2
+
+    def box_iou(self, box_a, box_b):
+        ax1, ay1, ax2, ay2 = box_a
+        bx1, by1, bx2, by2 = box_b
+
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+
+        iw = max(0, ix2 - ix1)
+        ih = max(0, iy2 - iy1)
+
+        inter = iw * ih
+
+        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+
+        union = area_a + area_b - inter
+
+        if union <= 0:
+            return 0.0
+
+        return inter / union
+
+    def is_duplicate_detection(self, new_box, detections):
+        nx1, ny1, nx2, ny2 = new_box
+        ncx = (nx1 + nx2) // 2
+        ncy = (ny1 + ny2) // 2
+
+        for det in detections:
+            old_box = det.get("box")
+            if old_box is None:
+                continue
+
+            ox1, oy1, ox2, oy2 = old_box
+            ocx = (ox1 + ox2) // 2
+            ocy = (oy1 + oy2) // 2
+
+            dist = ((ncx - ocx) ** 2 + (ncy - ocy) ** 2) ** 0.5
+            iou = self.box_iou(new_box, old_box)
+
+            if iou > 0.20 or dist < 28:
+                return True
+
+        return False
+
     def is_valid_detection_box(self, x1, y1, x2, y2, vehicle_type, confidence):
         box_w = max(0, x2 - x1)
         box_h = max(0, y2 - y1)
@@ -644,7 +723,10 @@ class DetectorThread:
         cx = (x1 + x2) // 2
         cy = (y1 + y2) // 2
 
-        if not self.is_inside_roi(cx, cy):
+        inside_roi = self.is_inside_roi(cx, cy)
+        inside_violation_zone = self.is_inside_polygon(cx, cy, VIOLATION_ZONE_POLYGON)
+
+        if not inside_roi and not inside_violation_zone:
             return False
 
         return True
@@ -704,7 +786,80 @@ class DetectorThread:
                     }
                 )
 
+        motor_rescue_detections = self.run_motor_rescue_detection(frame, detections)
+        detections.extend(motor_rescue_detections)
+
         return detections
+
+    def run_motor_rescue_detection(self, frame, detections):
+        if not MOTOR_RESCUE_ENABLED:
+            return []
+
+        x1, y1, x2, y2 = self.polygon_bbox(
+            VIOLATION_ZONE_POLYGON,
+            padding=MOTOR_RESCUE_PADDING,
+        )
+
+        crop = frame[y1:y2, x1:x2]
+
+        if crop is None or crop.size == 0:
+            return []
+
+        results = self.model.predict(
+            crop,
+            conf=MOTOR_RESCUE_CONF,
+            classes=[3],  # motorcycle only
+            imgsz=MOTOR_RESCUE_IMGSZ,
+            verbose=False,
+            device="cpu",
+        )
+
+        rescue_detections = []
+
+        for result in results:
+            for box in result.boxes:
+                confidence = float(box.conf[0])
+
+                bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
+
+                gx1 = x1 + bx1
+                gy1 = y1 + by1
+                gx2 = x1 + bx2
+                gy2 = y1 + by2
+
+                box_w = max(0, gx2 - gx1)
+                box_h = max(0, gy2 - gy1)
+                box_area = box_w * box_h
+
+                if box_area < MOTOR_RESCUE_MIN_BOX_AREA:
+                    continue
+
+                cx = (gx1 + gx2) // 2
+                cy = (gy1 + gy2) // 2
+
+                # Rescue ini khusus area merah / violation.
+                if not self.is_inside_polygon(cx, cy, VIOLATION_ZONE_POLYGON):
+                    continue
+
+                new_box = (gx1, gy1, gx2, gy2)
+
+                if self.is_duplicate_detection(new_box, detections):
+                    continue
+
+                rescue_detections.append(
+                    {
+                        "box": new_box,
+                        "center": (cx, cy),
+                        "vehicle_type": "motor",
+                        "confidence": confidence,
+                        "direction": "unknown",
+                        "track_id": None,
+                        "trajectory": [],
+                        "source": "motor_rescue",
+                    }
+                )
+
+        return rescue_detections
 
     def loop(self):
         min_interval = 1.0 / max(DETECTION_TARGET_FPS, 1)
@@ -896,11 +1051,10 @@ def draw_trajectory(frame, detection):
 
 
 def shrink_box_for_draw(box, vehicle_type=None):
-    x1, y1, x2, y2 = box
-
-    # Motor jangan dikecilin lagi. Box motor sudah kecil dari sananya.
     if vehicle_type == "motor":
         return box
+
+    x1, y1, x2, y2 = box
 
     box_w = max(1, x2 - x1)
     box_h = max(1, y2 - y1)
@@ -922,10 +1076,10 @@ def shrink_box_for_draw(box, vehicle_type=None):
 def draw_detection(frame, detection):
     vehicle_type = detection["vehicle_type"]
     x1, y1, x2, y2 = shrink_box_for_draw(detection["box"], vehicle_type)
+
     confidence = detection["confidence"]
     track_id = detection.get("track_id")
     direction = detection.get("direction", "unknown")
-
     color = get_detection_color(detection)
     direction_label = get_direction_label(direction)
 
