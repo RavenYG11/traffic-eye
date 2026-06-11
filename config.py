@@ -8,18 +8,18 @@ DISPLAY_HEIGHT = 540
 YOLO_MODEL = "models/yolo26n.pt"
 
 CONF_THRESHOLD = 0.18
-MODEL_IMGSZ = 768
+MODEL_IMGSZ = 736
 
 # Detection target FPS. Ini bukan display FPS.
-DETECTION_TARGET_FPS = 8
+DETECTION_TARGET_FPS = 13
 
 # Display FPS Target
-DISPLAY_TARGET_FPS = 30
+DISPLAY_TARGET_FPS = 40
 
 # Playback FPS.
 # Ini yang mengatur speed pemutaran frame CCTV FIFO.
 # Jangan terlalu tinggi supaya gerakan tidak jadi speed 2x.
-PLAYBACK_TARGET_FPS = 15
+PLAYBACK_TARGET_FPS = 20
 
 # Reader FPS target.
 # Jangan terlalu tinggi untuk HLS .m3u8, supaya buffer video tidak cepat habis.
