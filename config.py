@@ -7,11 +7,11 @@ DISPLAY_HEIGHT = 540
 
 YOLO_MODEL = "models/yolo26n.pt"
 
-CONF_THRESHOLD = 0.22
-MODEL_IMGSZ = 640
+CONF_THRESHOLD = 0.12
+MODEL_IMGSZ = 800
 
 # Detection target FPS. Ini bukan display FPS.
-DETECTION_TARGET_FPS = 5
+DETECTION_TARGET_FPS = 8
 
 # Display FPS Target
 DISPLAY_TARGET_FPS = 30
@@ -37,25 +37,25 @@ PLAYBACK_START_BUFFER_FRAMES = 3
 PLAYBACK_RESUME_BUFFER_FRAMES = 3
 
 # Filter box kecil supaya objek jauh/noise tidak terlalu banyak
-MIN_BOX_AREA = 220
+MIN_BOX_AREA = 100
 
 # Buang box yang terlalu besar dibanding frame.
 # Ini bantu cegah area jalan / gabungan kendaraan kebaca sebagai 1 object besar.
 MAX_BOX_AREA_RATIO = 0.28
 
 # Ukuran minimum box.
-MIN_BOX_WIDTH = 8
-MIN_BOX_HEIGHT = 8
+MIN_BOX_WIDTH = 5
+MIN_BOX_HEIGHT = 5
 
 # Confidence per tipe kendaraan.
 # Motor boleh sedikit lebih rendah karena motor CCTV sering kecil/jauh.
-MIN_MOTOR_CONF = 0.28
+MIN_MOTOR_CONF = 0.18
 MIN_MOBIL_CONF = 0.30
 
 # Filter bentuk box.
 # Terlalu gepeng / terlalu tinggi biasanya noise atau salah deteksi.
-MIN_ASPECT_RATIO = 0.30
-MAX_ASPECT_RATIO = 4.80
+MIN_ASPECT_RATIO = 0.20
+MAX_ASPECT_RATIO = 6.20
 
 # ROI area jalan untuk Perempatan Caman.
 # Format: titik polygon dalam koordinat frame 960x540.
@@ -64,11 +64,11 @@ MAX_ASPECT_RATIO = 4.80
 # Dibikin lebih fokus ke area jalan utama Perempatan Caman.
 # Area background atas/semak/gedung dikurangi supaya false detection turun.
 ROI_POLYGON = [
-    (0, 145),
-    (150, 125),
-    (360, 145),
-    (650, 125),
-    (960, 110),
+    (0, 70),
+    (220, 65),
+    (430, 75),
+    (650, 70),
+    (960, 65),
     (960, 540),
     (0, 540),
 ]
@@ -77,40 +77,49 @@ ROI_POLYGON = [
 # True dulu buat tuning titik polygon.
 SHOW_ZONE_DEBUG = True
 
-# Area biru:
-# Kendaraan yang masuk ke area ini dianggap IN,
-# asal tidak sedang bergerak balik ke zona atas.
+# Area biru / IN:
+# Sesuai marking biru terbaru:
+# mulai dari kiri bawah, naik ngikut bahu/trotoar kiri,
+# lalu batas diagonalnya berhenti di garis biru yang lu gambar.
 IN_ZONE_POLYGON = [
-    (0, 315),
-    (150, 275),
-    (355, 285),
-    (535, 430),
-    (520, 540),
+    (0, 540),
+    (0, 440),
+    (35, 425),
+    (75, 405),
+    (112, 378),
+    (145, 335),
+    (160, 265),
+    # garis diagonal biru ke arah kanan bawah
+    (675, 535),
+    # tutup bawah frame
     (0, 540),
 ]
 
-# Area oranye:
-# Kendaraan yang masuk ke area ini dianggap OUT.
+
+# Area oranye / OUT:
+# Sesuai marking oranye terbaru:
+# tidak mulai dari paling atas lagi,
+# tapi dari area truk/kiri atas, turun ngikut tikungan kiri,
+# lalu masuk ke garis horizontal oranye dan panah kanan.
 OUT_ZONE_POLYGON = [
-    (0, 145),
-    (210, 125),
-    (390, 185),
-    (360, 255),
-    (155, 245),
-    (0, 230),
+    (0, 112),
+    (160, 132),
+    (330, 158),
+    (426, 172),
+    # sisi kanan / ujung panah oranye
+    (365, 245),
+    (245, 252),
+    (145, 260),
+    # turun ngikut lengkungan/trotoar kiri
+    (135, 315),
+    (115, 350),
+    (80, 375),
+    (35, 392),
+    (0, 405),
+    # tutup ke kiri atas
+    (0, 112),
 ]
 
-# Zona atas / arah datang kendaraan normal.
-# Kalau track pernah masuk area biru/oranye lalu balik ke sini,
-# itu kandidat LAWAN_ARAH.
-UPSTREAM_ZONE_POLYGON = [
-    (0, 105),
-    (960, 90),
-    (960, 230),
-    (500, 235),
-    (250, 185),
-    (0, 230),
-]
 
 VIOLATION_ZONE_POLYGON = [
     (390, 95),
@@ -129,15 +138,15 @@ MAX_DETECTION_SEQ_GAP = 25
 
 # Tracking/trajectory.
 TRAJECTORY_MAX_POINTS = 80
-TRACK_MATCH_DISTANCE = 90
-TRACK_MAX_MISSED_FRAMES = 60
+TRACK_MATCH_DISTANCE = 120
+TRACK_MAX_MISSED_FRAMES = 90
 
 # Minimal perpindahan untuk fallback arah.
 DIRECTION_MIN_MOVE_PX = 35
 
 # Kalau YOLO miss sebentar, box tetap ditahan beberapa frame
 # supaya tidak kedip-kedip.
-TRACK_DRAW_HOLD_FRAMES = 45
+TRACK_DRAW_HOLD_FRAMES = 7
 
 # Kecilkan box hanya untuk tampilan.
 # Ini tidak mengubah center tracking / logic direction.

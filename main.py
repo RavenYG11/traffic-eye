@@ -49,7 +49,6 @@ from config import (
     IN_ZONE_POLYGON,
     OUT_ZONE_POLYGON,
     VIOLATION_ZONE_POLYGON,
-    UPSTREAM_ZONE_POLYGON,
     MAX_DETECTION_SEQ_GAP,
     TRAJECTORY_MAX_POINTS,
     TRACK_MATCH_DISTANCE,
@@ -228,9 +227,6 @@ class TrajectoryTracker:
         if self.point_inside_polygon(center, OUT_ZONE_POLYGON):
             return "out_zone"
 
-        if self.point_inside_polygon(center, UPSTREAM_ZONE_POLYGON):
-            return "upstream_zone"
-
         return "road_zone"
 
     def get_fallback_track_id(self, detection):
@@ -287,33 +283,25 @@ class TrajectoryTracker:
         move_dist = ((net_dx**2) + (net_dy**2)) ** 0.5
 
         # Jangan nilai status kalau trajectory belum cukup bergerak.
-        # Ini mencegah object yang baru muncul di IN langsung dianggap IN.
         if move_dist < DIRECTION_MIN_MOVE_PX:
             return "unknown"
 
-        origin_zone = track.get("origin_zone")
+        # INI BAGIAN YANG LU TANYA.
+        # Taruh di sini.
+        origin_zone = zones[0]
 
-        if origin_zone is None:
-            return "unknown"
-
-        # Kalau object masih di zone asalnya, jangan langsung kasih status.
-        # Contoh: motor muncul pertama kali di IN zone.
-        # Dia tetap TRACK sampai masuk zone lain.
         if current_zone == origin_zone:
             return "unknown"
 
-        # Masuk area merah dari zone mana pun selain merah = pelanggaran.
-        if current_zone == "violation_zone" and origin_zone != "violation_zone":
+        if current_zone == "violation_zone":
             track["final_status"] = "wrong_way"
             return "wrong_way"
 
-        # Masuk area biru dari zone lain = IN.
-        if current_zone == "in_zone" and origin_zone != "in_zone":
+        if current_zone == "in_zone":
             track["final_status"] = "in"
             return "in"
 
-        # Masuk area oren dari zone lain = OUT.
-        if current_zone == "out_zone" and origin_zone != "out_zone":
+        if current_zone == "out_zone":
             track["final_status"] = "out"
             return "out"
 
@@ -614,12 +602,29 @@ class DetectorThread:
         box_w = max(0, x2 - x1)
         box_h = max(0, y2 - y1)
 
-        if box_w < MIN_BOX_WIDTH or box_h < MIN_BOX_HEIGHT:
+        # Filter khusus per tipe kendaraan.
+        # Motor di CCTV biasanya kecil, blur, dan box-nya sering tidak stabil.
+        if vehicle_type == "motor":
+            min_box_width = 5
+            min_box_height = 5
+            min_box_area = 80
+            min_conf = MIN_MOTOR_CONF
+            min_aspect_ratio = 0.18
+            max_aspect_ratio = 6.50
+        else:
+            min_box_width = MIN_BOX_WIDTH
+            min_box_height = MIN_BOX_HEIGHT
+            min_box_area = MIN_BOX_AREA
+            min_conf = MIN_MOBIL_CONF
+            min_aspect_ratio = MIN_ASPECT_RATIO
+            max_aspect_ratio = MAX_ASPECT_RATIO
+
+        if box_w < min_box_width or box_h < min_box_height:
             return False
 
         box_area = box_w * box_h
 
-        if box_area < MIN_BOX_AREA:
+        if box_area < min_box_area:
             return False
 
         frame_area = DISPLAY_WIDTH * DISPLAY_HEIGHT
@@ -630,13 +635,10 @@ class DetectorThread:
 
         aspect_ratio = box_w / max(box_h, 1)
 
-        if aspect_ratio < MIN_ASPECT_RATIO or aspect_ratio > MAX_ASPECT_RATIO:
+        if aspect_ratio < min_aspect_ratio or aspect_ratio > max_aspect_ratio:
             return False
 
-        if vehicle_type == "motor" and confidence < MIN_MOTOR_CONF:
-            return False
-
-        if vehicle_type == "mobil" and confidence < MIN_MOBIL_CONF:
+        if confidence < min_conf:
             return False
 
         cx = (x1 + x2) // 2
@@ -858,13 +860,6 @@ def draw_zone_debug(frame):
 
     draw_polygon_outline(
         frame,
-        UPSTREAM_ZONE_POLYGON,
-        (0, 0, 255),
-        "UPSTREAM",
-    )
-
-    draw_polygon_outline(
-        frame,
         VIOLATION_ZONE_POLYGON,
         (0, 0, 255),
         "VIOLATION_ZONE",
@@ -900,8 +895,12 @@ def draw_trajectory(frame, detection):
     )
 
 
-def shrink_box_for_draw(box):
+def shrink_box_for_draw(box, vehicle_type=None):
     x1, y1, x2, y2 = box
+
+    # Motor jangan dikecilin lagi. Box motor sudah kecil dari sananya.
+    if vehicle_type == "motor":
+        return box
 
     box_w = max(1, x2 - x1)
     box_h = max(1, y2 - y1)
@@ -921,8 +920,8 @@ def shrink_box_for_draw(box):
 
 
 def draw_detection(frame, detection):
-    x1, y1, x2, y2 = shrink_box_for_draw(detection["box"])
     vehicle_type = detection["vehicle_type"]
+    x1, y1, x2, y2 = shrink_box_for_draw(detection["box"], vehicle_type)
     confidence = detection["confidence"]
     track_id = detection.get("track_id")
     direction = detection.get("direction", "unknown")
@@ -941,7 +940,7 @@ def draw_detection(frame, detection):
     else:
         text = f"ID:{track_id} {vehicle_type} {direction_label} {confidence:.2f}"
 
-        text_pos = (x1, max(y1 - 8, 20))
+    text_pos = (x1, max(y1 - 8, 20))
 
     # Outline hitam supaya tulisan tetap kebaca di kendaraan terang/gelap.
     cv2.putText(
@@ -1078,6 +1077,8 @@ def main():
     last_display_frame = None
     last_playback_pop_time = 0.0
     last_frame_seq = -1
+    last_tracked_detect_seq = -1
+    last_tracked_detections = []
 
     try:
         while True:
@@ -1150,8 +1151,12 @@ def main():
             if seq_gap > MAX_DETECTION_SEQ_GAP:
                 detections = detection_stabilizer.update([])
             else:
-                detections = trajectory_tracker.update(detections)
-                detections = detection_stabilizer.update(detections)
+                if detect_seq != last_tracked_detect_seq:
+                    last_tracked_detections = trajectory_tracker.update(detections)
+                    last_tracked_detect_seq = detect_seq
+                    detections = detection_stabilizer.update(last_tracked_detections)
+                else:
+                    detections = detection_stabilizer.update([])
 
             counts = count_vehicle_types(detections)
 
